@@ -1,0 +1,27 @@
+[package]
+name = "window-reload"
+version = "0.1.0"
+edition = "2021"
+description = "Record and restore Hyprland window/workspace layout and terminal working directories across restarts"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "window_reload"
+path = "src/lib.rs"
+
+[[bin]]
+name = "window-reloadd"
+path = "src/bin/window-reloadd.rs"
+
+[[bin]]
+name = "window-reload"
+path = "src/bin/window-reload.rs"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
