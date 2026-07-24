@@ -287,7 +287,16 @@ fn spawn_window(
     };
     let addr = wait_for_new_window(&before, &claimed, ws_id, w, timeout);
     match &addr {
-        Some(a) => placed.push((idx, a.clone())),
+        Some(a) => {
+            // Chrome forwards a new-window request to its already-running browser
+            // process, so the window can be created by that pre-existing pid and
+            // escape the `[workspace N silent]` spawn rule — landing on the current
+            // workspace instead. Place Chrome/PWA windows explicitly.
+            if matches!(w.kind, WindowKind::Chrome | WindowKind::ChromeApp) {
+                let _ = hypr::dispatch("movetoworkspacesilent", &format!("{ws_id},address:{a}"));
+            }
+            placed.push((idx, a.clone()));
+        }
         None => log(opts, &format!("  (timed out waiting for window: {})", describe(w))),
     }
     Ok(addr)
@@ -336,8 +345,17 @@ fn class_matches(c: &Client, w: &SavedWindow) -> bool {
     if c.class == w.class || c.initial_class == w.initial_class {
         return true;
     }
-    // Chrome PWA windows adopt their `chrome-<appid>-<profile>` class only after
-    // the app id is known; match on that substring.
+    // PWA windows settle into their `chrome-<appid>-<profile>` class once the app id
+    // is known. When both classes parse as PWA classes, require the app id AND the
+    // profile segment to match, so a same-app window on a *different* profile is not
+    // mistakenly claimed.
+    if let (Some((wa, wp)), Some((ca, cp))) =
+        (launch::parse_chrome_app(&w.class), launch::parse_chrome_app(&c.class))
+    {
+        return wa == ca && wp == cp;
+    }
+    // Before the class settles (still a generic `google-chrome`), fall back to an
+    // app-id match as a last resort.
     if let Some(app_id) = &w.app_id {
         return c.class.contains(app_id);
     }
@@ -427,6 +445,20 @@ fn present_signatures() -> R<HashSet<String>> {
         } else {
             None
         };
+        // Profile must be recovered the same way capture does, or a live Chrome
+        // window's signature would not match its saved counterpart.
+        let profile = match kind {
+            WindowKind::ChromeApp => launch::parse_chrome_app(&c.class).map(|(_, seg)| {
+                crate::proc::exe(c.pid)
+                    .as_deref()
+                    .and_then(crate::chrome::config_dir_for_exe)
+                    .map(|dir| crate::chrome::desanitize_profile(&dir, &seg))
+                    .unwrap_or(seg)
+            }),
+            WindowKind::Chrome => crate::chrome::config_dir_for_class(&c.class)
+                .and_then(|dir| crate::chrome::find_profile(&dir, &c.title)),
+            _ => None,
+        };
         let cmdline = if kind == WindowKind::Generic {
             crate::proc::cmdline(c.pid)
         } else {
@@ -437,6 +469,7 @@ fn present_signatures() -> R<HashSet<String>> {
             &c.class,
             term_cwd.as_deref(),
             app_id.as_deref(),
+            profile.as_deref(),
             &cmdline,
         ));
     }

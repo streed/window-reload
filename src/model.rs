@@ -169,7 +169,9 @@ pub struct SavedWindow {
     #[serde(default)]
     pub term_cwd: Option<String>,
 
-    // Chrome PWA specifics.
+    // Chrome specifics. `profile` is the real on-disk profile directory
+    // (e.g. "Default", "Profile 1") for both main and PWA windows, so restore can
+    // relaunch the right profile; Chrome's own session restore reopens the tabs.
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
@@ -203,6 +205,7 @@ impl SavedWindow {
             &self.class,
             self.term_cwd.as_deref(),
             self.app_id.as_deref(),
+            self.profile.as_deref(),
             &self.cmdline,
         )
     }
@@ -210,17 +213,25 @@ impl SavedWindow {
 
 /// Build the idempotency signature from raw fields. Used both when reading a saved
 /// window and when inspecting a live one, so the two can never drift apart.
+///
+/// A main Chrome window's signature includes its profile: every such window shares
+/// the class `google-chrome`, so without the profile two windows from different
+/// profiles would collide, and a single open Chrome window would suppress restore
+/// of all the others.
 pub fn signature_for(
     kind: WindowKind,
     class: &str,
     term_cwd: Option<&str>,
     app_id: Option<&str>,
+    profile: Option<&str>,
     cmdline: &[String],
 ) -> String {
     match kind {
         WindowKind::Terminal => format!("term:{}:{}", class, term_cwd.unwrap_or("")),
-        WindowKind::ChromeApp => format!("chromeapp:{}", app_id.unwrap_or(class)),
-        WindowKind::Chrome => format!("chrome:{}", class),
+        WindowKind::ChromeApp => {
+            format!("chromeapp:{}:{}", app_id.unwrap_or(class), profile.unwrap_or(""))
+        }
+        WindowKind::Chrome => format!("chrome:{}:{}", class, profile.unwrap_or("")),
         WindowKind::Generic => format!("generic:{}:{}", class, cmdline.join(" ")),
     }
 }

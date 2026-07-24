@@ -93,17 +93,32 @@ pub fn sh_join(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// The chrome/chromium binary to relaunch with, inferred from the recorded argv.
-fn chrome_binary(w: &SavedWindow) -> String {
-    if let Some(first) = w.cmdline.first() {
-        let base = first.rsplit('/').next().unwrap_or(first);
-        // Renderer/helper processes are never the window's launcher, but the window
-        // pid is always the browser process, so cmdline[0] is the browser binary.
-        if base.contains("chrome") || base.contains("chromium") || base.contains("brave") {
-            return first.clone();
+/// A clean chrome/chromium/brave binary to relaunch with.
+///
+/// The recorded argv is unusable for Chrome: the browser rewrites its own argv into
+/// a single space-joined blob (shared by every window and profile, and sometimes
+/// carrying an unrelated window's `--app-id`), so replaying it either runs a bogus
+/// command or reopens the wrong thing. We resolve the binary from `/proc/<pid>/exe`
+/// (captured as `exe`) instead, and only accept a real, space-free path; otherwise
+/// we fall back to a stable launcher name.
+fn resolve_chrome_bin(w: &SavedWindow) -> String {
+    if let Some(exe) = &w.exe {
+        if !exe.contains(' ') && std::path::Path::new(exe).exists() {
+            let base = exe.rsplit('/').next().unwrap_or(exe).to_ascii_lowercase();
+            if base.contains("chrome") || base.contains("chromium") || base.contains("brave") {
+                return exe.clone();
+            }
         }
     }
-    "google-chrome-stable".to_string()
+    // Infer a stable launcher from the class / exe family.
+    let hay = format!("{} {}", w.class, w.exe.as_deref().unwrap_or("")).to_ascii_lowercase();
+    if hay.contains("chromium") {
+        "chromium".to_string()
+    } else if hay.contains("brave") {
+        "brave-browser".to_string()
+    } else {
+        "google-chrome-stable".to_string()
+    }
 }
 
 /// The command that should recreate this window, as a shell command string
@@ -130,15 +145,26 @@ pub fn command_string(w: &SavedWindow) -> String {
             sh_join(&argv)
         }
         WindowKind::ChromeApp => {
-            let bin = chrome_binary(w);
+            // `profile` is the real on-disk directory, desanitized at capture time.
             let profile = w.profile.as_deref().unwrap_or("Default");
-            let mut argv = vec![bin, format!("--profile-directory={profile}")];
+            let mut argv = vec![resolve_chrome_bin(w), format!("--profile-directory={profile}")];
             if let Some(app_id) = &w.app_id {
                 argv.push(format!("--app-id={app_id}"));
             }
             sh_join(&argv)
         }
-        WindowKind::Chrome | WindowKind::Generic => {
+        WindowKind::Chrome => {
+            // Don't replay argv (see resolve_chrome_bin). Just launch the right
+            // profile; Chrome's own "continue where you left off" restores that
+            // profile's windows and tabs. A bare per-profile launch (no
+            // `--new-window`) is what triggers that session restore.
+            let mut argv = vec![resolve_chrome_bin(w)];
+            if let Some(profile) = &w.profile {
+                argv.push(format!("--profile-directory={profile}"));
+            }
+            sh_join(&argv)
+        }
+        WindowKind::Generic => {
             if w.cmdline.is_empty() {
                 return w.exe.clone().unwrap_or_else(|| w.class.to_ascii_lowercase());
             }
@@ -160,5 +186,83 @@ pub fn command_string(w: &SavedWindow) -> String {
             }
             sh_join(&argv)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::WindowKind;
+
+    /// A blank SavedWindow to tweak per test. `exe` is left None so
+    /// `resolve_chrome_bin` deterministically falls back to a stable launcher.
+    fn win(kind: WindowKind, class: &str) -> SavedWindow {
+        SavedWindow {
+            address: String::new(),
+            last_seen_unix: 0,
+            kind,
+            class: class.into(),
+            initial_class: class.into(),
+            title: String::new(),
+            initial_title: String::new(),
+            xwayland: false,
+            workspace_id: 1,
+            workspace_name: "1".into(),
+            monitor: 0,
+            at: [0, 0],
+            size: [100, 100],
+            floating: false,
+            fullscreen: 0,
+            pinned: false,
+            group_key: None,
+            group_index: 0,
+            pid: 0,
+            cmdline: Vec::new(),
+            exe: None,
+            is_terminal: false,
+            term_cwd: None,
+            app_id: None,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn chrome_main_window_launches_its_profile() {
+        // Restore just relaunches the profile; Chrome restores its own tabs.
+        let mut w = win(WindowKind::Chrome, "google-chrome");
+        w.profile = Some("Profile 1".into());
+        assert_eq!(
+            command_string(&w),
+            "google-chrome-stable '--profile-directory=Profile 1'"
+        );
+    }
+
+    #[test]
+    fn chrome_never_replays_rewritten_argv_blob() {
+        // The poisoned single-element blob Chrome writes to /proc/<pid>/cmdline.
+        let mut w = win(WindowKind::Chrome, "google-chrome");
+        w.cmdline = vec!["/opt/google/chrome/chrome --app-id=pehnimlghmeel".into()];
+        w.profile = Some("Default".into());
+        let cmd = command_string(&w);
+        assert!(!cmd.contains("--app-id"), "must not leak the rewritten blob: {cmd}");
+        assert!(!cmd.contains("chrome --app-id"), "blob must not become a bogus binary: {cmd}");
+        assert_eq!(cmd, "google-chrome-stable --profile-directory=Default");
+    }
+
+    #[test]
+    fn chrome_without_profile_falls_back_to_bare_launch() {
+        let w = win(WindowKind::Chrome, "google-chrome");
+        assert_eq!(command_string(&w), "google-chrome-stable");
+    }
+
+    #[test]
+    fn pwa_uses_desanitized_profile_and_app_id() {
+        let mut w = win(WindowKind::ChromeApp, "chrome-pehnim-Profile_1");
+        w.app_id = Some("pehnim".into());
+        w.profile = Some("Profile 1".into()); // desanitized at capture
+        assert_eq!(
+            command_string(&w),
+            "google-chrome-stable '--profile-directory=Profile 1' --app-id=pehnim"
+        );
     }
 }

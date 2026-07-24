@@ -4,6 +4,7 @@
 //! - [`model`]  – Hyprland IPC JSON structs and our persisted snapshot schema.
 //! - [`hypr`]   – talking to Hyprland (hyprctl queries/dispatches + event socket path).
 //! - [`proc`]   – reading `/proc` to recover terminal working directories and launch argv.
+//! - [`chrome`] – reading Chrome's session files to recover a window's profile and tabs.
 //! - [`launch`] – classifying a window and deriving the command that recreates it.
 //! - [`layout`] – reconstructing a workspace's dwindle BSP tree from window geometry.
 //! - [`capture`]– building a [`model::Snapshot`] from the live Hyprland state.
@@ -12,6 +13,7 @@
 //! - [`daemon`] – the long-running recorder that snapshots on relevant events.
 
 pub mod capture;
+pub mod chrome;
 pub mod daemon;
 pub mod hypr;
 pub mod launch;

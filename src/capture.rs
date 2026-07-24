@@ -73,39 +73,37 @@ pub fn live_snapshot() -> R<Snapshot> {
 /// Merge a fresh live snapshot with the previous one, carrying forward windows
 /// that closed within `keep_closed` so a restore can bring them back.
 ///
-/// A previous window is considered still-present if a live window shares its
-/// address (same window) or — for windows recreated with a new address, e.g. after
-/// a compositor restart — its signature. Everything else is "recently closed" and
-/// kept until it ages out.
+/// A previous window is dropped (not carried) when it is already represented in
+/// the live snapshot — either by a live window sharing its address (the same
+/// window still open) or by any live window sharing its signature (an equivalent
+/// window is still open, whether it kept its address or was recreated with a new
+/// one after a compositor restart). Only a window that is *truly gone* — no live
+/// window shares its signature — is remembered, and only until it ages out.
+///
+/// The signature check is deliberately coverage-based rather than counted:
+/// signatures are not unique (two terminals in one directory share one), and they
+/// are the only identity a restore has. Carrying a closed window whose signature
+/// is still live would therefore spawn a duplicate of the live window on the next
+/// restore, which is exactly how ghost windows used to accumulate.
 pub fn merge(mut live: Snapshot, prev: &Snapshot, keep_closed: Duration) -> Snapshot {
     let now = live.captured_at_unix;
     let ttl = keep_closed.as_secs();
 
     let live_addrs: HashSet<&str> = live.windows.iter().map(|w| w.address.as_str()).collect();
-    let prev_addrs: HashSet<&str> = prev.windows.iter().map(|w| w.address.as_str()).collect();
-
-    // Signatures of live windows whose address is new since `prev` — these can
-    // absorb a previous entry whose window was recreated under a new address.
-    let mut new_live_sig: HashMap<String, usize> = HashMap::new();
-    for w in &live.windows {
-        if !prev_addrs.contains(w.address.as_str()) {
-            *new_live_sig.entry(w.signature()).or_insert(0) += 1;
-        }
-    }
+    // Signatures currently represented by a live window; a closed window matching
+    // one of these is redundant and must not be carried forward.
+    let live_sigs: HashSet<String> = live.windows.iter().map(|w| w.signature()).collect();
 
     let mut carried: Vec<SavedWindow> = Vec::new();
     for pw in &prev.windows {
         if live_addrs.contains(pw.address.as_str()) {
             continue; // same window still open; the live copy is fresher
         }
-        if let Some(c) = new_live_sig.get_mut(&pw.signature()) {
-            if *c > 0 {
-                *c -= 1; // recreated with a new address; represented by a live window
-                continue;
-            }
+        if live_sigs.contains(&pw.signature()) {
+            continue; // an equivalent window is still open; carrying it would duplicate it
         }
         if now.saturating_sub(pw.last_seen_unix) <= ttl {
-            carried.push(pw.clone()); // recently closed — remember it
+            carried.push(pw.clone()); // recently closed and truly gone — remember it
         }
     }
 
@@ -132,13 +130,31 @@ fn build_window(c: &Client, group_key_of: &HashMap<String, String>, now: u64) ->
         None
     };
 
-    let (app_id, profile) = if kind == WindowKind::ChromeApp {
-        match launch::parse_chrome_app(&c.class) {
-            Some((a, p)) => (Some(a), Some(p)),
+    // Chrome specifics. All windows of a Chrome instance share one browser process
+    // (so pid/argv reveal neither profile) and the compositor only reports the
+    // class; we recover the profile from Chrome's session files so restore can
+    // relaunch it. See [`crate::chrome`].
+    let exe = proc::exe(c.pid);
+    let (app_id, profile) = match kind {
+        WindowKind::ChromeApp => match launch::parse_chrome_app(&c.class) {
+            // The class profile segment is sanitized (spaces → '_'); restore its real
+            // on-disk directory name so `--profile-directory` matches.
+            Some((a, seg)) => {
+                let profile = exe
+                    .as_deref()
+                    .and_then(crate::chrome::config_dir_for_exe)
+                    .map(|dir| crate::chrome::desanitize_profile(&dir, &seg))
+                    .unwrap_or(seg);
+                (Some(a), Some(profile))
+            }
             None => (None, None),
+        },
+        WindowKind::Chrome => {
+            let profile = crate::chrome::config_dir_for_class(&c.class)
+                .and_then(|dir| crate::chrome::find_profile(&dir, &c.title));
+            (None, profile)
         }
-    } else {
-        (None, None)
+        _ => (None, None),
     };
 
     let (group_key, group_index) = match group_key_of.get(&c.address) {
@@ -175,7 +191,7 @@ fn build_window(c: &Client, group_key_of: &HashMap<String, String>, now: u64) ->
         group_index,
         pid: c.pid,
         cmdline: proc::cmdline(c.pid),
-        exe: proc::exe(c.pid),
+        exe,
         is_terminal,
         term_cwd,
         app_id,
@@ -270,6 +286,71 @@ mod tests {
         let live = snap(150, vec![]);
         let merged = merge(live, &prev, Duration::from_secs(0));
         assert!(merged.windows.is_empty(), "keep_closed=0 must not carry anything");
+    }
+
+    #[test]
+    fn closed_ghost_not_carried_while_equivalent_window_lives() {
+        // Two terminals share a directory (same signature). One is closed and
+        // remembered in `prev`; the other kept running with a stable address.
+        // The closed ghost must not be carried — it would re-spawn a duplicate of
+        // the surviving terminal on the next restore.
+        let prev = snap(
+            100,
+            vec![
+                win("0xLIVE", "Alacritty", 7, Some("/proj"), 100),
+                win("0xGHOST", "Alacritty", 7, Some("/proj"), 90), // closed a moment ago
+            ],
+        );
+        let live = snap(120, vec![win("0xLIVE", "Alacritty", 7, Some("/proj"), 120)]);
+        let merged = merge(live, &prev, Duration::from_secs(600));
+        assert_eq!(
+            merged.windows.len(),
+            1,
+            "a recently-closed window must not duplicate a still-live equivalent"
+        );
+        assert_eq!(merged.windows[0].address, "0xLIVE");
+    }
+
+    #[test]
+    fn multiple_live_same_signature_all_kept() {
+        // Genuinely two terminals open in the same directory: both are live and
+        // both must survive the merge (this is not duplication).
+        let prev = snap(
+            100,
+            vec![
+                win("0xA", "Alacritty", 7, Some("/proj"), 100),
+                win("0xB", "Alacritty", 7, Some("/proj"), 100),
+            ],
+        );
+        let live = snap(
+            120,
+            vec![
+                win("0xA", "Alacritty", 7, Some("/proj"), 120),
+                win("0xB", "Alacritty", 7, Some("/proj"), 120),
+            ],
+        );
+        let merged = merge(live, &prev, Duration::from_secs(600));
+        assert_eq!(merged.windows.len(), 2, "both live terminals must be kept");
+    }
+
+    #[test]
+    fn all_same_signature_closed_are_remembered() {
+        // When every window of a signature is gone, the closed ones are still
+        // remembered (nothing live covers them).
+        let prev = snap(
+            100,
+            vec![
+                win("0xA", "Alacritty", 7, Some("/proj"), 100),
+                win("0xB", "Alacritty", 7, Some("/proj"), 95),
+            ],
+        );
+        let live = snap(120, vec![]); // whole workspace closed
+        let merged = merge(live, &prev, Duration::from_secs(600));
+        assert_eq!(
+            merged.windows.len(),
+            2,
+            "with no live equivalent, recently-closed windows are remembered"
+        );
     }
 
     #[test]
